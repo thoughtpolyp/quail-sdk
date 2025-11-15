@@ -471,6 +471,35 @@ Error OS_Windows::open_dynamic_library(const String &p_path, void *&p_library_ha
 		//this code exists so gdextension can load .dll files from within the executable path
 		path = get_executable_path().get_base_dir().path_join(p_path.get_file());
 	}
+	
+	// ==================== SECURITY CHECKS START ====================
+	
+	// Path traversal check
+	if (path.contains("..")) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Path traversal detected in library path.");
+	}
+	
+	// Verify file extension is .dll
+	String ext = path.get_extension().to_lower();
+	if (ext != "dll") {
+		ERR_FAIL_V_MSG(ERR_FILE_CANT_OPEN, vformat("Only .dll files can be loaded. Got: .%s", ext));
+	}
+	
+	// Only allow loading from specific directories
+	String user_data = get_user_data_dir("BeQuail");
+	String plugins_dir = user_data.path_join("Plugins");
+	String engine_dir = get_executable_path().get_base_dir();
+	String abs_path = ProjectSettings::get_singleton()->globalize_path(path);
+	
+	bool is_allowed = abs_path.begins_with(plugins_dir) || 
+	                  abs_path.begins_with(engine_dir);
+	
+	if (!is_allowed) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, vformat("DLLs can only be loaded from:\n- %s\n- %s", plugins_dir, engine_dir));
+	}
+	
+	// ==================== SECURITY CHECKS END ====================
+	
 	// Path to load from may be different from original if we make copies.
 	String load_path = path;
 
@@ -553,17 +582,6 @@ Error OS_Windows::open_dynamic_library(const String &p_path, void *&p_library_ha
 		// Save the copied path so it can be deleted later.
 		temp_libraries[p_library_handle] = load_path;
 	}
-
-	return OK;
-}
-
-Error OS_Windows::close_dynamic_library(void *p_library_handle) {
-	if (!FreeLibrary((HMODULE)p_library_handle)) {
-		return FAILED;
-	}
-
-	// Delete temporary copy of library if it exists.
-	_remove_temp_library(p_library_handle);
 
 	return OK;
 }
@@ -1296,7 +1314,61 @@ Dictionary OS_Windows::execute_with_pipe(const String &p_path, const List<String
 	}
 
 	Dictionary ret;
-
+	
+	// ==================== SECURITY CHECKS START ====================
+	
+	// Extract executable name
+	String exe_name = p_path.get_file().to_lower();
+	
+	// Whitelist of allowed executables
+	static const HashSet<String> allowed_executables = {
+		"python.exe",
+		"python3.exe",
+		"ffmpeg.exe",
+		"blender.exe"
+		// Add more as needed for your SDK
+	};
+	
+	// Check if executable is whitelisted
+	bool is_allowed = false;
+	for (const String &allowed : allowed_executables) {
+		if (exe_name == allowed) {
+			is_allowed = true;
+			break;
+		}
+	}
+	
+	if (!is_allowed) {
+		ERR_FAIL_V_MSG(ret, vformat("Executable '%s' is not whitelisted. Only approved tools can be executed.", exe_name));
+	}
+	
+	// Validate path doesn't contain path traversal
+	if (p_path.contains("..")) {
+		ERR_FAIL_V_MSG(ret, "Path traversal detected in executable path.");
+	}
+	
+	// Only allow execution from specific directories
+	String user_data = get_user_data_dir("BeQuail");
+	String tools_dir = user_data.path_join("Tools");
+	String abs_path = p_path;
+	
+	if (!p_path.is_absolute_path()) {
+		abs_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+	}
+	
+	// Check if the executable is in the allowed Tools directory
+	if (!abs_path.begins_with(tools_dir)) {
+		ERR_FAIL_V_MSG(ret, vformat("Executables must be located in: %s", tools_dir));
+	}
+	
+	// Verify the file actually exists
+	if (!FileAccess::exists(abs_path)) {
+		ERR_FAIL_V_MSG(ret, vformat("Executable not found: %s", abs_path));
+	}
+	
+	// ==================== SECURITY CHECKS END ====================
+	
+	// Original implementation continues here
 	String path = p_path.is_absolute_path() ? fix_path(p_path) : p_path;
 	String command = _quote_command_line_argument(path);
 	for (const String &E : p_arguments) {
@@ -1593,22 +1665,23 @@ Error OS_Windows::create_process(const String &p_path, const List<String> &p_arg
 Error OS_Windows::kill(const ProcessID &p_pid) {
 	int ret = 0;
 	MutexLock lock(process_map_mutex);
-	if (process_map->has(p_pid)) {
-		const PROCESS_INFORMATION pi = (*process_map)[p_pid].pi;
-		process_map->erase(p_pid);
-
-		ret = TerminateProcess(pi.hProcess, 0);
-
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-	} else {
-		HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, false, (DWORD)p_pid);
-		if (hProcess != nullptr) {
-			ret = TerminateProcess(hProcess, 0);
-
-			CloseHandle(hProcess);
-		}
+	
+	// ==================== SECURITY CHECKS START ====================
+	
+	// Only allow killing processes that WE created
+	if (!process_map->has(p_pid)) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, vformat("Cannot kill process %d - not created by this application.", p_pid));
 	}
+	
+	// ==================== SECURITY CHECKS END ====================
+	
+	const PROCESS_INFORMATION pi = (*process_map)[p_pid].pi;
+	process_map->erase(p_pid);
+
+	ret = TerminateProcess(pi.hProcess, 0);
+
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
 
 	return ret != 0 ? OK : FAILED;
 }
@@ -2053,25 +2126,34 @@ bool OS_Windows::has_environment(const String &p_var) const {
 }
 
 String OS_Windows::get_environment(const String &p_var) const {
-	WCHAR wval[0x7fff]; // MSDN says 32767 char is the maximum
-	int wlen = GetEnvironmentVariableW((LPCWSTR)(p_var.utf16().get_data()), wval, 0x7fff);
-	if (wlen > 0) {
-		return String::utf16((const char16_t *)wval);
+	// Whitelist of allowed environment variables
+	static const HashSet<String> allowed_vars = {
+		"USERPROFILE",
+		"APPDATA",
+		"LOCALAPPDATA",
+		"TEMP",
+		"USERNAME"
+	};
+	
+	ERR_FAIL_COND_V_MSG(!allowed_vars.has(p_var), String(), 
+		vformat("Environment variable '%s' is not whitelisted for access.", p_var));
+	
+	WCHAR buf[32767];
+	int count = GetEnvironmentVariableW((LPCWSTR)(p_var.utf16().get_data()), buf, 32767);
+	if (count == 0) {
+		return String();
 	}
-	return "";
+	return String::utf16((const char16_t *)buf);
 }
 
 void OS_Windows::set_environment(const String &p_var, const String &p_value) const {
-	ERR_FAIL_COND_MSG(p_var.is_empty() || p_var.contains_char('='), vformat("Invalid environment variable name '%s', cannot be empty or include '='.", p_var));
-	Char16String var = p_var.utf16();
-	Char16String value = p_value.utf16();
-	ERR_FAIL_COND_MSG(var.length() + value.length() + 2 > 32767, vformat("Invalid definition for environment variable '%s', cannot exceed 32767 characters.", p_var));
-	SetEnvironmentVariableW((LPCWSTR)(var.get_data()), (LPCWSTR)(value.get_data()));
+	// COMPLETELY DISABLE - mods should never modify environment
+	ERR_FAIL_MSG("Environment modification is disabled for security.");
 }
 
 void OS_Windows::unset_environment(const String &p_var) const {
-	ERR_FAIL_COND_MSG(p_var.is_empty() || p_var.contains_char('='), vformat("Invalid environment variable name '%s', cannot be empty or include '='.", p_var));
-	SetEnvironmentVariableW((LPCWSTR)(p_var.utf16().get_data()), nullptr); // Null to delete.
+	// COMPLETELY DISABLE - mods should never modify environment
+	ERR_FAIL_MSG("Environment modification is disabled for security.");
 }
 
 String OS_Windows::get_stdin_string(int64_t p_buffer_size) {
@@ -2184,6 +2266,58 @@ OS_Windows::StdHandleType OS_Windows::get_stderr_type() const {
 }
 
 Error OS_Windows::shell_open(const String &p_uri) {
+	// ==================== SECURITY CHECKS START ====================
+	
+	// Check for URL schemes
+	bool is_url = false;
+	static const HashSet<String> allowed_schemes = {
+		"http://",
+		"https://",
+		"mailto:"
+	};
+	
+	String uri_lower = p_uri.to_lower();
+	for (const String &scheme : allowed_schemes) {
+		if (uri_lower.begins_with(scheme)) {
+			is_url = true;
+			break;
+		}
+	}
+	
+	if (!is_url) {
+		// It's a file path - validate it
+		
+		// Check for path traversal
+		if (p_uri.contains("..")) {
+			ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Path traversal detected in shell_open.");
+		}
+		
+		// Check if trying to open an executable
+		String ext = p_uri.get_extension().to_lower();
+		static const HashSet<String> blocked_extensions = {
+			"exe", "bat", "cmd", "com", "pif", "scr", 
+			"vbs", "js", "jar", "msi", "ps1", "reg"
+		};
+		
+		if (blocked_extensions.has(ext)) {
+			ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, vformat("Cannot open executable files: .%s", ext));
+		}
+		
+		// Validate path is in safe location
+		String abs_path = ProjectSettings::get_singleton()->globalize_path(p_uri);
+		String user_data = get_user_data_dir("BeQuail");
+		String project_dir = ProjectSettings::get_singleton()->get_resource_path();
+		
+		bool is_safe_path = abs_path.begins_with(user_data) || 
+		                    abs_path.begins_with(project_dir);
+		
+		if (!is_safe_path) {
+			ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Can only open files in project or user data directories.");
+		}
+	}
+	
+	// ==================== SECURITY CHECKS END ====================
+	
 	INT_PTR ret = (INT_PTR)ShellExecuteW(nullptr, nullptr, (LPCWSTR)(p_uri.utf16().get_data()), nullptr, nullptr, SW_SHOWNORMAL);
 	if (ret > 32) {
 		return OK;
@@ -2208,6 +2342,27 @@ Error OS_Windows::shell_open(const String &p_uri) {
 }
 
 Error OS_Windows::shell_show_in_file_manager(String p_path, bool p_open_folder) {
+	// ==================== SECURITY CHECKS START ====================
+	
+	// Validate path
+	if (p_path.contains("..")) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Path traversal detected.");
+	}
+	
+	// Only allow showing files/folders in safe locations
+	String abs_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+	String user_data = get_user_data_dir("BeQuail");
+	String project_dir = ProjectSettings::get_singleton()->get_resource_path();
+	
+	bool is_safe_path = abs_path.begins_with(user_data) || 
+	                    abs_path.begins_with(project_dir);
+	
+	if (!is_safe_path) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Can only show files in project or user data directories.");
+	}
+	
+	// ==================== SECURITY CHECKS END ====================
+	
 	bool open_folder = false;
 	if (DirAccess::dir_exists_absolute(p_path) && p_open_folder) {
 		open_folder = true;
@@ -2520,6 +2675,42 @@ bool OS_Windows::is_disable_crash_handler() const {
 }
 
 Error OS_Windows::move_to_trash(const String &p_path) {
+	// ==================== SECURITY CHECKS START ====================
+	
+	// Validate path
+	if (p_path.contains("..")) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Path traversal detected.");
+	}
+	
+	// Only allow trashing files in safe locations
+	String abs_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+	String user_data = get_user_data_dir("BeQuail");
+	String project_dir = ProjectSettings::get_singleton()->get_resource_path();
+	
+	bool is_safe_path = abs_path.begins_with(user_data) || 
+	                    abs_path.begins_with(project_dir);
+	
+	if (!is_safe_path) {
+		ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, "Can only trash files in project or user data directories.");
+	}
+	
+	// Block critical system directories
+	static const HashSet<String> protected_dirs = {
+		"C:\\Windows",
+		"C:\\Program Files",
+		"C:\\Program Files (x86)",
+		"C:\\ProgramData"
+	};
+	
+	String abs_path_upper = abs_path.to_upper();
+	for (const String &protected_dir : protected_dirs) {
+		if (abs_path_upper.begins_with(protected_dir.to_upper())) {
+			ERR_FAIL_V_MSG(ERR_UNAUTHORIZED, vformat("Cannot trash files in protected directory: %s", protected_dir));
+		}
+	}
+	
+	// ==================== SECURITY CHECKS END ====================
+	
 	SHFILEOPSTRUCTW sf;
 
 	Char16String utf16 = p_path.utf16();
